@@ -1,0 +1,42 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Agents collection: Only authenticated agents can write their own data
+    // Agent ID should match authenticated user's UID (e.g., service account UID)
+    match /agents/{agentId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.auth.uid == agentId;
+      allow update: if request.auth != null && request.auth.uid == agentId;
+      allow delete: if false; // Agents should not delete themselves from here directly
+    }
+
+    // Devices collection: Agents can write/update devices associated with their agentId
+    // Users can read devices associated with agents they have access to
+    match /devices/{deviceId} {
+      // Allow agent to create/update devices linked to their agentId
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.agentId;
+      allow update: if request.auth != null && request.auth.uid == resource.data.agentId;
+
+      // Allow read for authenticated users who have access to the agent (e.g., agentId in their user doc's allowedAgents array)
+      allow read: if request.auth != null && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.allowedAgents.hasAny([resource.data.agentId]);
+
+      allow delete: if false;
+    }
+
+    // Alerts collection: Alerts are created by Cloud Functions, read by dashboard users
+    match /alerts/{alertId} {
+      // Cloud Functions will write alerts, so no direct client write allowed
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+      // Allow read for authenticated users linked to the agent that generated the alert
+      allow read: if request.auth != null && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.allowedAgents.hasAny([resource.data.agentId]);
+    }
+
+    // Users collection: Each user can read/write their own preferences and notification tokens
+    match /users/{uid} {
+      allow read, create, update: if request.auth != null && request.auth.uid == uid;
+      allow delete: if false;
+    }
+  }
+}
