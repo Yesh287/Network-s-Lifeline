@@ -1,6 +1,6 @@
 
 import * as admin from 'firebase-admin';
-import * as nmap from 'nmap.js';
+import * as nmap from 'node-nmap';
 import * as ping from 'ping';
 import { networkInterfaces } from 'os';
 

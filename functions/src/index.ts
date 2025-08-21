@@ -1,5 +1,8 @@
 import * as functions from 'firebase-functions';
 import * as admin from 'firebase-admin';
+import { onDocumentWritten } from 'firebase-functions/v2/firestore';
+import { CallableRequest } from 'firebase-functions/v2/https';
+
 // Import SendGrid if you decide to implement email alerts
 // import * as sgMail from '@sendgrid/mail';
 
@@ -32,129 +35,127 @@ async function sendFCMNotification(token: string, title: string, body: string, d
  * This function is triggered when a device document is created or updated.
  * It ensures firstSeen is set and manages agent lastSeen.
  */
-export const onDeviceWrite = functions.firestore
-    .document('devices/{deviceId}')
-    .onWrite(async (change, context) => {
-        const deviceData = change.after.data();
-        const previousDeviceData = change.before.data();
+export const onDeviceWrite = onDocumentWritten('devices/{deviceId}', async (event) => {
+    const deviceData = event.data?.after.data();
+    const previousDeviceData = event.data?.before.data();
 
-        if (!deviceData) {
-            console.log('Device deleted, no action needed.');
-            return null;
-        }
+    if (!deviceData) {
+        console.log('Device deleted, no action needed.');
+        return null;
+    }
 
-        const deviceId = context.params.deviceId;
-        const agentId = deviceData.agentId;
+    const deviceId = event.params.deviceId;
+    const agentId = deviceData.agentId;
 
-        // Update agent's lastSeen timestamp whenever one of its devices is updated
-        if (agentId) {
-            const agentRef = db.collection('agents').doc(agentId);
-            await agentRef.set({
-                lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-                // Also add agentId and host on initial creation if not present
-                agentId: agentId, // Ensure agentId is set
-                host: deviceData.agentHost || 'unknown', // Assuming agentHost might come from agent's initial registration
+    // Update agent's lastSeen timestamp whenever one of its devices is updated
+    if (agentId) {
+        const agentRef = db.collection('agents').doc(agentId);
+        await agentRef.set({
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+            // Also add agentId and host on initial creation if not present
+            agentId: agentId, // Ensure agentId is set
+            host: deviceData.agentHost || 'unknown', // Assuming agentHost might come from agent's initial registration
+        }, { merge: true });
+    }
+
+    // Handle new device registration (firstSeen)
+    if (!previousDeviceData || !previousDeviceData.firstSeen) {
+        if (!deviceData.firstSeen) {
+            console.log(`Setting firstSeen for new device: ${deviceId}`);
+            await event.data.after.ref.set({
+                firstSeen: admin.firestore.FieldValue.serverTimestamp(),
+                status: deviceData.status || 'online', // Default status for new devices
+                seenCount: 1,
+                offlineChecks: 0,
             }, { merge: true });
         }
+    }
 
-        // Handle new device registration (firstSeen)
-        if (!previousDeviceData || !previousDeviceData.firstSeen) {
-            if (!deviceData.firstSeen) {
-                console.log(`Setting firstSeen for new device: ${deviceId}`);
-                await change.after.ref.set({
-                    firstSeen: admin.firestore.FieldValue.serverTimestamp(),
-                    status: deviceData.status || 'online', // Default status for new devices
-                    seenCount: 1,
-                    offlineChecks: 0,
-                }, { merge: true });
-            }
-        }
+    // Offline detection logic
+    // This part is crucial for status changes and alert generation
+    const heartbeatIntervalMs = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '60000', 10);
+    const offlineThresholdChecks = parseInt(process.env.OFFLINE_THRESHOLD_CHECKS || '3', 10);
+    // The backend calculates status=offline if now - lastSeen > offlineThreshold (configurable; default 3 * heartbeatInterval).
+    const offlineThresholdMs = offlineThresholdChecks * heartbeatIntervalMs;
 
-        // Offline detection logic
-        // This part is crucial for status changes and alert generation
-        const heartbeatIntervalMs = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '60000', 10);
-        const offlineThresholdChecks = parseInt(process.env.OFFLINE_THRESHOLD_CHECKS || '3', 10);
-        // The backend calculates status=offline if now - lastSeen > offlineThreshold (configurable; default 3 * heartbeatInterval).
-        const offlineThresholdMs = offlineThresholdChecks * heartbeatIntervalMs;
+    const lastSeenMs = deviceData.lastSeen?.toMillis();
+    const nowMs = Date.now();
 
-        const lastSeenMs = deviceData.lastSeen?.toMillis();
-        const nowMs = Date.now();
+    if (lastSeenMs && (nowMs - lastSeenMs > offlineThresholdMs)) {
+        // Device is considered offline by backend logic
+        if (deviceData.status === 'online') {
+            console.log(`Device ${deviceId} (IP: ${deviceData.ip}) is now offline.`);
 
-        if (lastSeenMs && (nowMs - lastSeenMs > offlineThresholdMs)) {
-            // Device is considered offline by backend logic
-            if (deviceData.status === 'online') {
-                console.log(`Device ${deviceId} (IP: ${deviceData.ip}) is now offline.`);
+            // Update device status to offline in Firestore
+            await event.data.after.ref.update({ status: 'offline' });
 
-                // Update device status to offline in Firestore
-                await change.after.ref.update({ status: 'offline' });
-
-                // Create an alert document
-                const alertMessage = `Device ${deviceData.hostname || deviceData.ip} went offline.`;
-                await db.collection('alerts').add({
-                    deviceId: deviceId,
-                    agentId: agentId,
-                    type: 'offline',
-                    message: alertMessage,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    acknowledged: false,
-                });
-
-                // Send push notifications to relevant users
-                const usersSnapshot = await db.collection('users').get();
-                usersSnapshot.forEach(async (doc) => {
-                    const userData = doc.data();
-                    if (userData.notificationTokens && userData.notificationTokens.length > 0) {
-                        for (const token of userData.notificationTokens) {
-                            await sendFCMNotification(token, 'Device Offline', alertMessage, { deviceId: deviceId, type: 'offline' });
-                        }
-                    }
-                    // Optional: Send email notification
-                    // if (userData.email && SENDGRID_API_KEY) {
-                    //     const msg = {
-                    //         to: userData.email,
-                    //         from: 'noreply@yourdomain.com', // Replace with your verified SendGrid sender
-                    //         subject: 'Device Offline Alert',
-                    //         text: alertMessage,
-                    //         html: `<strong>${alertMessage}</strong><p>Device IP: ${deviceData.ip}</p>`, // Basic HTML
-                    //     };
-                    //     try {
-                    //         await sgMail.send(msg);
-                    //         console.log('Email sent to:', userData.email);
-                    //     } catch (emailError) {
-                    //         console.error('Error sending email:', emailError);
-                    //     }
-                    // }
-                });
-            }
-        } else if (deviceData.status === 'offline' && lastSeenMs && (nowMs - lastSeenMs <= offlineThresholdMs)) {
-            // Device was offline but now its lastSeen is recent, meaning it's back online
-            console.log(`Device ${deviceId} (IP: ${deviceData.ip}) is back online.`);
-            await change.after.ref.update({ status: 'online' });
-
-            // Optionally, create an 'online' alert or clear previous alerts
-            const alertMessage = `Device ${deviceData.hostname || deviceData.ip} is back online.`;
+            // Create an alert document
+            const alertMessage = `Device ${deviceData.hostname || deviceData.ip} went offline.`;
             await db.collection('alerts').add({
                 deviceId: deviceId,
                 agentId: agentId,
-                type: 'online',
+                type: 'offline',
                 message: alertMessage,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 acknowledged: false,
             });
 
+            // Send push notifications to relevant users
             const usersSnapshot = await db.collection('users').get();
             usersSnapshot.forEach(async (doc) => {
                 const userData = doc.data();
                 if (userData.notificationTokens && userData.notificationTokens.length > 0) {
                     for (const token of userData.notificationTokens) {
-                        await sendFCMNotification(token, 'Device Online', alertMessage, { deviceId: deviceId, type: 'online' });
+                        await sendFCMNotification(token, 'Device Offline', alertMessage, { deviceId: deviceId, type: 'offline' });
                     }
                 }
+                // Optional: Send email notification
+                // if (userData.email && SENDGRID_API_KEY) {
+                //     const msg = {
+                //         to: userData.email,
+                //         from: 'noreply@yourdomain.com', // Replace with your verified SendGrid sender
+                //         subject: 'Device Offline Alert',
+                //         text: alertMessage,
+                //         html: `<strong>${alertMessage}</strong><p>Device IP: ${deviceData.ip}</p>`, // Basic HTML
+                //     };
+                //     try {
+                //         await sgMail.send(msg);
+                //         console.log('Email sent to:', userData.email);
+                //     } catch (emailError) {
+                //         console.error('Error sending email:', emailError);
+                //     }
+                // }
             });
         }
+    } else if (deviceData.status === 'offline' && lastSeenMs && (nowMs - lastSeenMs <= offlineThresholdMs)) {
+        // Device was offline but now its lastSeen is recent, meaning it's back online
+        console.log(`Device ${deviceId} (IP: ${deviceData.ip}) is back online.`);
+        await event.data.after.ref.update({ status: 'online' });
 
-        return null;
-    });
+        // Optionally, create an 'online' alert or clear previous alerts
+        const alertMessage = `Device ${deviceData.hostname || deviceData.ip} is back online.`;
+        await db.collection('alerts').add({
+            deviceId: deviceId,
+            agentId: agentId,
+            type: 'online',
+            message: alertMessage,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            acknowledged: false,
+        });
+
+        const usersSnapshot = await db.collection('users').get();
+        usersSnapshot.forEach(async (doc) => {
+            const userData = doc.data();
+            if (userData.notificationTokens && userData.notificationTokens.length > 0) {
+                for (const token of userData.notificationTokens) {
+                    await sendFCMNotification(token, 'Device Online', alertMessage, { deviceId: deviceId, type: 'online' });
+                }
+            }
+        });
+    }
+
+    return null;
+});
 
 
 /**
@@ -260,7 +261,8 @@ export const onDeviceWrite = functions.firestore
  * Callable Cloud Function to simulate a device going down for testing/demo purposes.
  * This function should be restricted to admin users or a demo mode.
  */
-export const simulateDeviceDown = functions.https.onCall(async (data, context) => {
+export const simulateDeviceDown = functions.https.onCall(
+    async (data: { deviceId: string }, context: CallableRequest) => {
     // In a real application, you would add authentication and authorization checks here.
     // e.g., if (!context.auth || !context.auth.token.isAdmin) {
     //     throw new functions.https.HttpsError('permission-denied', 'Not authorized to perform this action.');

@@ -17,7 +17,7 @@
   "dependencies": {
     "firebase-admin": "^11.11.0",
     "firebase-functions": "^4.5.0",
-    "@sendgrid/mail": "^8.1.0" // Optional, uncomment if using SendGrid
+    "@sendgrid/mail": "^8.1.0"
   },
   "devDependencies": {
     "@typescript-eslint/eslint-plugin": "^6.13.2",
