@@ -84,7 +84,7 @@ To get a local copy up and running, follow these simple steps.
 4.  **Configure the Dashboard**:
 
       * Navigate to the `dashboard` directory.
-      * Open `dashboard/js/firebase-config.js`.
+      * Open `dashboard/src/script.js`.
       * In your Firebase project settings, find your project's web app configuration details and paste them into this file.
 
 -----
